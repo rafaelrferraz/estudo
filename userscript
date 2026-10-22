@@ -1,0 +1,1514 @@
+// ==UserScript==
+// @name         Estudo Pró - Caderno de Alta Performance (Concurseiro) oficial
+// @namespace    http://tampermonkey.net/
+// @version      35.1
+// @match        https://concursos.estrategia.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_xmlhttpRequest
+// @connect      estudos-sync.rrferraz-server.com.br
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let menuFlutuante = null;
+    let modalNota = null;
+    let selecaoAtualGuardada = null;
+    let ultimaUrl = location.href;
+
+    let aplicandoMutacaoInterna = false;
+    let timerRestauracao = null;
+    let timerSync = null;
+    let sincronizacaoInicialFeita = false;
+
+    // ==================================================================
+    // 🔧 BLINDAGEM — desembrulhar dupla serialização
+    // ==================================================================
+    function desembrulhar(v) {
+        let x = v, n = 0;
+        while (typeof x === 'string' && n < 5) {
+            try { x = JSON.parse(x); } catch (e) { break; }
+            n++;
+        }
+        return x;
+    }
+
+    // ------------------------------------------------------------------
+    // Armazenamento
+    // ------------------------------------------------------------------
+    const TEM_GM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function'
+                && typeof GM_deleteValue === 'function' && typeof GM_listValues === 'function';
+
+    function stLer(chave) {
+        if (TEM_GM) {
+            try {
+                const v = GM_getValue(chave, null);
+                if (v !== null && v !== undefined) return v;
+            } catch (e) { }
+        }
+        try { return localStorage.getItem(chave); } catch (e) { return null; }
+    }
+
+    function stGravar(chave, valor) {
+        let ok = false;
+        if (TEM_GM) {
+            try { GM_setValue(chave, valor); ok = true; }
+            catch (e) { console.warn('[EstudoPro] GM_setValue falhou', e); }
+        }
+        try { localStorage.setItem(chave, valor); ok = true; } catch (e) { }
+        return ok;
+    }
+
+    function stApagar(chave) {
+        if (TEM_GM) { try { GM_deleteValue(chave); } catch (e) { } }
+        try { localStorage.removeItem(chave); } catch (e) { }
+    }
+
+    function stChaves(prefixo) {
+        const conjunto = new Set();
+        if (TEM_GM) {
+            try {
+                GM_listValues().forEach(k => {
+                    if (k && k.startsWith(prefixo)) conjunto.add(k);
+                });
+            } catch (e) { }
+        }
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith(prefixo)) conjunto.add(k);
+            }
+        } catch (e) { }
+        return Array.from(conjunto);
+    }
+
+    const PREFIXO_URL = 'estudo_pro_u_';
+    const PREFIXO_LEGADO = 'estudo_pro_q_';
+    const IGNORAR_UI = 'script, style, noscript, template, textarea, svg, button, #ep-menu-flutuante, #ep-modal-overlay, #ep-fab-container';
+    const TAGS_ESTRUTURAIS = 'table, thead, tbody, tfoot, tr, colgroup, ul, ol, select, dl';
+    const SEL_BLOCO = 'p, div, li, tr, td, th, h1, h2, h3, h4, h5, h6, blockquote, section, article';
+    const TAM_CONTEXTO = 30;
+
+    const estilo = document.createElement('style');
+    estilo.innerHTML = `
+        .estudo-pro-grifo { cursor: pointer; border-radius: 2px; transition: filter 0.2s; }
+        .estudo-pro-grifo:hover { filter: brightness(0.9); }
+        #ep-fab-container { position: fixed; bottom: 25px; right: 25px; z-index: 99998; font-family: sans-serif; display: flex; flex-direction: column-reverse; align-items: center; gap: 10px; }
+        #ep-fab-btn { background: #2d3748; color: #fff; width: 52px; height: 52px; border-radius: 50%; border: 2px solid #4a5568; box-shadow: 0 4px 15px rgba(0,0,0,0.5); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform 0.2s, background 0.2s; }
+        #ep-fab-btn:hover { transform: scale(1.1); background: #4a5568; }
+        #ep-fab-btn svg { width: 24px; height: 24px; fill: currentColor; }
+        #ep-fab-sub-menu { display: flex; flex-direction: column; gap: 8px; opacity: 0; visibility: hidden; transform: translateY(10px); transition: opacity 0.25s ease, transform 0.25s ease, visibility 0.25s; }
+        #ep-fab-container:hover #ep-fab-sub-menu { opacity: 1; visibility: visible; transform: translateY(0); }
+        .ep-sub-btn { background: #1a202c; color: #fff; width: 42px; height: 42px; border-radius: 50%; border: 1px solid #4a5568; box-shadow: 0 4px 10px rgba(0,0,0,0.4); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; transition: transform 0.2s, background 0.2s; }
+        .ep-sub-btn:hover { transform: scale(1.12); background: #4a5568; }
+        .ep-sub-btn.btn-html { color: #9ae6b4; }
+        .ep-sub-btn.btn-sync { color: #63b3ed; font-size: 16px; }
+        .ep-sub-btn.btn-trash { color: #fc8181; font-size: 16px; }
+        .ep-sub-btn.btn-trash:hover { background: #e53e3e; color: #fff; }
+        #ep-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.6); z-index: 100000; display: none; align-items: center; justify-content: center; font-family: sans-serif; }
+        #ep-modal-box { background: #1a202c; color: #fff; width: 420px; padding: 20px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 1px solid #4a5568; display: flex; flex-direction: column; gap: 12px; }
+        #ep-modal-box textarea { width: 100%; height: 120px; background: #2d3748; color: #fff; border: 1px solid #4a5568; border-radius: 6px; padding: 10px; font-size: 13px; resize: vertical; outline: none; box-sizing: border-box; }
+        #ep-modal-box textarea:focus { border-color: #805ad5; }
+        .ep-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+        .ep-modal-actions button { padding: 6px 14px; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 12px; border: none; }
+        #ep-modal-salvar { background: #805ad5; color: #fff; }
+        #ep-modal-cancelar { background: #4a5568; color: #fff; }
+    `;
+    document.head.appendChild(estilo);
+
+    if (document.readyState === 'complete') {
+        setTimeout(iniciarSistemaGlobal, 0);
+    } else {
+        window.addEventListener('load', iniciarSistemaGlobal);
+    }
+
+    setInterval(() => {
+        if (location.href !== ultimaUrl) {
+            ultimaUrl = location.href;
+            sincronizacaoInicialFeita = false;
+            setTimeout(iniciarSistemaGlobal, 1000);
+        }
+    }, 500);
+
+    setInterval(() => {
+        enviarParaServidorSilencioso();
+    }, 3600000);
+
+    function agendarRestauracao() {
+        if (timerRestauracao) clearTimeout(timerRestauracao);
+        timerRestauracao = setTimeout(() => { restaurarGrifosSalvos(); }, 600);
+    }
+
+    const observer = new MutationObserver((mutations) => {
+        if (aplicandoMutacaoInterna) return;
+        let deveAtualizar = false;
+        for (let m of mutations) {
+            if (m.target && m.target.closest && m.target.closest('#ep-menu-flutuante, #ep-modal-overlay, #ep-fab-container')) continue;
+            if (m.type === 'childList' && m.addedNodes.length > 0) { deveAtualizar = true; break; }
+            if (m.type === 'characterData') { deveAtualizar = true; break; }
+        }
+        if (deveAtualizar) agendarRestauracao();
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    window.addEventListener('focus', agendarRestauracao);
+
+    function iniciarSistemaGlobal() {
+        criarMenuSelecao();
+        criarModalNota();
+        criarBotaoHover();
+        agendarRestauracao();
+
+        if (!sincronizacaoInicialFeita) {
+            puxarDoServidorNaInicializacao();
+            sincronizacaoInicialFeita = true;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Utilitários UI e Hash
+    // ------------------------------------------------------------------
+    function gerarId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+    function escaparHtml(str) { const d = document.createElement('div'); d.textContent = str == null ? '' : String(str); return d.innerHTML; }
+    function escaparAttr(str) { return String(str).replace(/["\\]/g, '\\$&'); }
+    function tamSufixoComum(a, b) { let i = 0; while (i < a.length && i < b.length && a[a.length - 1 - i] === b[b.length - 1 - i]) i++; return i; }
+    function tamPrefixoComum(a, b) { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; }
+
+    function urlAtual() {
+        let path = location.pathname;
+        if (path.endsWith('/') && location.search) {
+            path = path.slice(0, -1);
+        }
+        return location.origin + path + location.search;
+    }
+
+    function hashSimples(s) {
+        let h = 0;
+        for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+        return Math.abs(h).toString(36);
+    }
+
+    function hash53(s) {
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+        for (let i = 0; i < s.length; i++) {
+            const ch = s.charCodeAt(i);
+            h1 = Math.imul(h1 ^ ch, 2654435761);
+            h2 = Math.imul(h2 ^ ch, 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+    }
+    function idDeterministico(url, trecho) { return 'g' + hash53(url + '|' + trecho).toString(36); }
+
+    // ------------------------------------------------------------------
+    // Menu e UI
+    // ------------------------------------------------------------------
+    function criarMenuSelecao() {
+        if (menuFlutuante) return;
+        menuFlutuante = document.createElement('div');
+        menuFlutuante.id = 'ep-menu-flutuante';
+        menuFlutuante.style.cssText = `position: absolute; background: #2d3748; color: #fff; padding: 8px 12px; border-radius: 6px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); z-index: 99999; display: none; font-family: sans-serif; font-size: 13px; align-items: center; gap: 8px;`;
+        menuFlutuante.addEventListener('mousedown', (e) => e.preventDefault());
+        document.body.appendChild(menuFlutuante);
+    }
+
+    function criarModalNota() {
+        if (document.getElementById('ep-modal-overlay')) return;
+        modalNota = document.createElement('div');
+        modalNota.id = 'ep-modal-overlay';
+        modalNota.innerHTML = `
+            <div id="ep-modal-box">
+                <div style="font-weight: bold; font-size: 14px; border-bottom: 1px solid #4a5568; padding-bottom: 6px;">📝 Anotação Profissional</div>
+                <textarea id="ep-modal-textarea" placeholder="Digite sua anotação, esquema ou mnemônico aqui..."></textarea>
+                <div class="ep-modal-actions">
+                    <button id="ep-modal-cancelar">Cancelar</button>
+                    <button id="ep-modal-salvar">Salvar Nota</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modalNota);
+        document.getElementById('ep-modal-cancelar').onclick = () => { modalNota.style.display = 'none'; selecaoAtualGuardada = null; };
+    }
+
+    function abrirModalNota(callbackSalvar, textoInicial) {
+        const textarea = document.getElementById('ep-modal-textarea');
+        textarea.value = textoInicial || "";
+        modalNota.style.display = 'flex';
+        textarea.focus();
+
+        const btnSalvar = document.getElementById('ep-modal-salvar');
+        const novoBtnSalvar = btnSalvar.cloneNode(true);
+        btnSalvar.parentNode.replaceChild(novoBtnSalvar, btnSalvar);
+        document.getElementById('ep-modal-salvar').onclick = () => {
+            modalNota.style.display = 'none';
+            callbackSalvar(textarea.value.trim());
+        };
+    }
+
+    function criarBotaoHover() {
+        if (document.getElementById('ep-fab-container')) return;
+        const container = document.createElement('div');
+        container.id = 'ep-fab-container';
+        container.innerHTML = `
+            <button id="ep-fab-btn">
+                <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+            </button>
+            <div id="ep-fab-sub-menu">
+                <button id="ep-sub-trash" class="ep-sub-btn btn-trash" title="Apagar TODOS os dados do site (localStorage + Tampermonkey)">🗑️</button>
+                <button id="ep-sub-sync" class="ep-sub-btn btn-sync" title="Forçar Sincronização">☁️</button>
+                <button id="ep-sub-html" class="ep-sub-btn btn-html" title="Baixar HTML Manual">HTML</button>
+            </div>
+        `;
+        document.body.appendChild(container);
+
+        document.getElementById('ep-sub-html').onclick = (e) => { e.stopPropagation(); exportarHtmlInterativo(); };
+        document.getElementById('ep-sub-sync').onclick = (e) => { e.stopPropagation(); enviarParaServidorSilencioso(); alert("Sincronização forçada enviada!"); };
+        document.getElementById('ep-sub-trash').onclick = (e) => { e.stopPropagation(); apagarTodosOsDados(); };
+    }
+
+    // ------------------------------------------------------------------
+    // 🗑️ Apagar todos os dados (localStorage + GM) — com confirmação
+    // ------------------------------------------------------------------
+    function apagarTodosOsDados() {
+        const chavesUrl = stChaves(PREFIXO_URL);
+        const chavesLegado = stChaves(PREFIXO_LEGADO);
+        const totalChaves = chavesUrl.length + chavesLegado.length;
+
+        if (totalChaves === 0) {
+            alert("Nenhum dado encontrado para apagar neste site.");
+            return;
+        }
+
+        const confirmacao1 = confirm(
+            `⚠️ ATENÇÃO — APAGAR TUDO DO SITE\n\n` +
+            `Serão removidos:\n` +
+            `• ${chavesUrl.length} página(s) com grifos (formato novo)\n` +
+            `• ${chavesLegado.length} bloco(s) legado(s)\n` +
+            `• Cópias no localStorage E no armazenamento do Tampermonkey\n\n` +
+            `Isso NÃO apaga o servidor remoto, mas a próxima sincronização\n` +
+            `pode acabar regravando os dados puxados de lá.\n\n` +
+            `Continuar?`
+        );
+        if (!confirmacao1) return;
+
+        const confirmacao2 = prompt(
+            `Para confirmar a exclusão, digite exatamente:\n\nAPAGAR`
+        );
+        if (confirmacao2 !== 'APAGAR') {
+            alert("Operação cancelada. Nada foi apagado.");
+            return;
+        }
+
+        let apagadas = 0;
+        [...chavesUrl, ...chavesLegado].forEach(chave => {
+            try { stApagar(chave); apagadas++; } catch (e) { console.warn('[EstudoPro] Falha ao apagar', chave, e); }
+        });
+
+        // Remove qualquer chave solta do localStorage que comece com os prefixos
+        // (garante limpeza mesmo se GM_listValues não pegou algo)
+        try {
+            const remover = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && (k.startsWith(PREFIXO_URL) || k.startsWith(PREFIXO_LEGADO))) remover.push(k);
+            }
+            remover.forEach(k => localStorage.removeItem(k));
+        } catch (e) { }
+
+        // Cancela timers pendentes para não regravar nada em seguida
+        if (timerSync) { clearTimeout(timerSync); timerSync = null; }
+        if (timerRestauracao) { clearTimeout(timerRestauracao); timerRestauracao = null; }
+
+        alert(
+            `🗑️ Dados apagados!\n\n` +
+            `Chaves processadas: ${apagadas}\n\n` +
+            `A página será recarregada para limpar a interface.\n` +
+            `(Se a sincronização automática puxar dados do servidor, eles voltarão.)`
+        );
+
+        setTimeout(() => location.reload(), 300);
+    }
+
+    // ------------------------------------------------------------------
+    // Sincronização (Envio e Pull) — 🔧 BLINDADO
+    // ------------------------------------------------------------------
+    function agendarSyncAutomatico() {
+        if (timerSync) clearTimeout(timerSync);
+        timerSync = setTimeout(() => {
+            enviarParaServidorSilencioso();
+        }, 5000);
+    }
+
+    // 🔧 BLINDAGEM: desembrulha antes de enviar, envia com 1 stringify só
+    function enviarParaServidorSilencioso() {
+        const pacote = {};
+        stChaves(PREFIXO_URL).forEach(c => {
+            const v = stLer(c);
+            if (!v) return;
+            const limpo = desembrulhar(v);
+            if (limpo && limpo.grifos) pacote[c] = JSON.stringify(limpo);
+        });
+        stChaves(PREFIXO_LEGADO).forEach(c => {
+            const v = stLer(c);
+            if (!v) return;
+            const limpo = desembrulhar(v);
+            if (limpo) pacote[c] = JSON.stringify(limpo);
+        });
+
+        if (Object.keys(pacote).length === 0) return;
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: "https://estudos-sync.rrferraz-server.com.br/api/sync",
+            headers: { "Content-Type": "application/json" },
+            data: JSON.stringify(pacote),
+            onload: function(r) {
+                if (r.status >= 200 && r.status < 300) {
+                    console.log('☁️ Sincronizado (limpo).');
+                } else {
+                    console.warn('☁️ Falha na sincronização:', r.status);
+                }
+            },
+            onerror: function(e) { console.error('☁️ Erro de rede na sincronização:', e); }
+        });
+    }
+
+    // 🔧 BLINDAGEM: desembrulha o remoto antes de gravar
+    function puxarDoServidorNaInicializacao() {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: "https://estudos-sync.rrferraz-server.com.br/api/sync",
+            onload: function(r) {
+                if (r.status !== 200) return;
+                try {
+                    const pacoteRemoto = JSON.parse(r.responseText);
+                    if (!pacoteRemoto || Object.keys(pacoteRemoto).length === 0) return;
+
+                    let atualizou = false;
+
+                    Object.keys(pacoteRemoto).forEach(chave => {
+                        if (!chave.startsWith(PREFIXO_URL)) return;
+                        const remoto = desembrulhar(pacoteRemoto[chave]);
+                        if (!remoto || !Array.isArray(remoto.grifos)) return;
+                        const jsonRemoto = JSON.stringify(remoto);
+                        const local = desembrulhar(stLer(chave));
+                        const jsonLocal = local ? JSON.stringify(local) : '';
+                        if (jsonLocal !== jsonRemoto) {
+                            stGravar(chave, jsonRemoto);
+                            atualizou = true;
+                        }
+                    });
+
+                    stChaves(PREFIXO_URL).forEach(chave => {
+                        if (!pacoteRemoto[chave]) {
+                            stApagar(chave);
+                            atualizou = true;
+                        }
+                    });
+
+                    if (atualizou) {
+                        location.reload();
+                    }
+                } catch (e) { console.error('Erro ao puxar sync:', e); }
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Lógica de Grifos
+    // ------------------------------------------------------------------
+    function mostrarMenuSelecao(rect) {
+        menuFlutuante.innerHTML = `
+            <span style="font-size: 11px; color: #a0aec0; margin-right: 4px;">Grifar:</span>
+            <button id="ep-btn-amarelo" style="background: #fef08a; border: none; width: 20px; height: 20px; border-radius: 50%; cursor: pointer;" title="Amarelo"></button>
+            <button id="ep-btn-roxo" style="background: #d8b4fe; border: none; width: 20px; height: 20px; border-radius: 50%; cursor: pointer;" title="Roxo"></button>
+            <button id="ep-btn-verde" style="background: #bbf7d0; border: none; width: 20px; height: 20px; border-radius: 50%; cursor: pointer;" title="Verde"></button>
+            <button id="ep-btn-rosa" style="background: #fbcfe8; border: none; width: 20px; height: 20px; border-radius: 50%; cursor: pointer;" title="Rosa"></button>
+            <button id="ep-btn-azul" style="background: #bfdbfe; border: none; width: 20px; height: 20px; border-radius: 50%; cursor: pointer;" title="Fórmulas"></button>
+            <div style="width: 1px; height: 16px; background: #4a5568; margin: 0 4px;"></div>
+            <button id="ep-btn-anotar" style="background: transparent; border: none; cursor: pointer; font-size: 16px; padding: 0 2px;" title="Nota">📝</button>
+        `;
+        posicionarMenu(rect);
+        document.getElementById('ep-btn-amarelo').onclick = () => aplicarGrifoEstavel('#fef08a', '');
+        document.getElementById('ep-btn-roxo').onclick = () => aplicarGrifoEstavel('#d8b4fe', '');
+        document.getElementById('ep-btn-verde').onclick = () => aplicarGrifoEstavel('#bbf7d0', '');
+        document.getElementById('ep-btn-rosa').onclick = () => aplicarGrifoEstavel('#fbcfe8', '');
+        document.getElementById('ep-btn-azul').onclick = () => aplicarGrifoEstavel('#bfdbfe', '');
+        document.getElementById('ep-btn-anotar').onclick = () => { esconderMenu(); abrirModalNota((nota) => aplicarGrifoEstavel('#fef08a', nota)); };
+    }
+
+    function obterSpansDoGrifo(spanEl) {
+        const id = spanEl.getAttribute('data-grifo-id');
+        if (!id) return [spanEl];
+        return Array.from(document.querySelectorAll(`.estudo-pro-grifo[data-grifo-id="${escaparAttr(id)}"]`));
+    }
+
+    function mostrarMenuGerenciarGrifo(rect, spanEl) {
+        const spansGrifo = obterSpansDoGrifo(spanEl);
+        const idGrifo = spanEl.getAttribute('data-grifo-id');
+        const url = spanEl.getAttribute('data-url');
+        const corAtual = spanEl.style.backgroundColor || '#fef08a';
+
+        function paraHex(c) {
+            if (!c) return '#fef08a';
+            if (c.startsWith('#')) return c;
+            const m = c.match(/\d+/g);
+            if (!m) return '#fef08a';
+            return '#' + m.slice(0, 3).map(x => (+x).toString(16).padStart(2, '0')).join('');
+        }
+        const corHexAtual = paraHex(corAtual);
+
+        const paleta = [
+            { hex: '#fef08a', titulo: 'Amarelo' },
+            { hex: '#d8b4fe', titulo: 'Roxo' },
+            { hex: '#bbf7d0', titulo: 'Verde' },
+            { hex: '#fbcfe8', titulo: 'Rosa' },
+            { hex: '#bfdbfe', titulo: 'Fórmulas' }
+        ];
+
+        menuFlutuante.innerHTML = `
+            <span style="font-size: 11px; color: #a0aec0; margin-right: 4px;">Editar:</span>
+            ${paleta.map(p => `
+                <button class="ep-cor-btn" data-cor="${p.hex}" title="${p.titulo}"
+                    style="background: ${p.hex}; border: ${p.hex === corHexAtual ? '2px solid #fff' : 'none'}; width: 20px; height: 20px; border-radius: 50%; cursor: pointer; padding: 0; box-shadow: ${p.hex === corHexAtual ? '0 0 0 1px #4a5568' : 'none'}; margin-right: 4px;">
+                </button>
+            `).join('')}
+            <div style="width: 1px; height: 16px; background: #4a5568; margin: 0 4px;"></div>
+            <button id="ep-btn-editar-nota" style="background: transparent; border: none; cursor: pointer; font-size: 16px; padding: 0 2px;" title="Editar Nota">📝</button>
+            <button id="ep-btn-print" style="background: transparent; border: none; cursor: pointer; font-size: 16px; padding: 0 2px;" title="Anexar Print">📸</button>
+            <button id="ep-btn-remover" style="background: transparent; border: none; cursor: pointer; font-size: 16px; padding: 0 2px;" title="Remover Grifo">🗑️</button>
+        `;
+        posicionarMenu(rect);
+
+        menuFlutuante.querySelectorAll('.ep-cor-btn').forEach(btn => {
+            btn.onclick = () => {
+                const novaCor = btn.getAttribute('data-cor');
+                if (novaCor === corHexAtual) { esconderMenu(); return; }
+
+                aplicandoMutacaoInterna = true;
+                try {
+                    spansGrifo.forEach(s => { s.style.backgroundColor = novaCor; });
+                } finally {
+                    setTimeout(() => { aplicandoMutacaoInterna = false; }, 0);
+                }
+
+                atualizarGrifoSalvo(url, idGrifo, { cor_fundo: novaCor });
+                esconderMenu();
+            };
+        });
+
+        document.getElementById('ep-btn-editar-nota').onclick = () => {
+            esconderMenu();
+            abrirModalNota((novaNota) => {
+                spansGrifo.forEach(s => s.setAttribute('data-nota', novaNota));
+                atualizarGrifoSalvo(url, idGrifo, { nota_vinculada: novaNota || null });
+            }, spanEl.getAttribute('data-nota') || "");
+        };
+
+        document.getElementById('ep-btn-print').onclick = () => {
+            esconderMenu();
+            capturarPrint(url, idGrifo);
+        };
+
+        document.getElementById('ep-btn-remover').onclick = () => {
+            aplicandoMutacaoInterna = true;
+            try { spansGrifo.forEach(desembrulharSpan); } finally { setTimeout(() => { aplicandoMutacaoInterna = false; }, 0); }
+            esconderMenu();
+            removerGrifoSalvo(url, idGrifo);
+        };
+    }
+
+    function capturarPrint(url, idGrifo) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 999999; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; font-family: sans-serif; color: #fff; font-size: 18px; font-weight: bold; cursor: copy;`;
+        overlay.innerHTML = `📸 Cole a imagem aqui (Ctrl+V)<br><span style="font-size:12px; font-weight:normal; margin-top:10px;">Clique fora ou aperte ESC para cancelar</span>`;
+
+        const onPaste = (e) => {
+            const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+            for (let index in items) {
+                const item = items[index];
+                if (item.kind === 'file' && item.type.startsWith('image/')) {
+                    const blob = item.getAsFile();
+
+                    if (blob.size > 2 * 1024 * 1024) {
+                        alert("A imagem é muito grande (maior que 2MB). Tente um print menor.");
+                        overlay.remove();
+                        return;
+                    }
+
+                    const reader = new FileReader();
+                    reader.onload = (evt) => {
+                        const base64 = evt.target.result;
+
+                        const pagina = lerPagina(url);
+                        if (pagina) {
+                            const grifo = pagina.grifos.find(g => g.id_grifo === idGrifo);
+                            if (grifo) {
+                                const imgHtml = `<br><details style="margin-top:8px; background:#2d3748; padding:6px; border-radius:4px; border:1px solid #4a5568;"><summary style="cursor:pointer; font-size:12px; color:#a0aec0; font-weight:bold; outline:none;">🖼️ Mostrar Imagem</summary><img src="${base64}" style="max-width:100%; border-radius:4px; margin-top:8px; display:block;"></details>`;
+
+                                grifo.nota_vinculada = (grifo.nota_vinculada || '') + imgHtml;
+                                grifo.atualizado_em = Date.now();
+                                salvarPagina(pagina);
+
+                                const spans = obterSpansDoGrifo({ getAttribute: () => idGrifo });
+                                spans.forEach(s => s.setAttribute('data-nota', grifo.nota_vinculada));
+
+                                alert("📸 Print anexado com sucesso!");
+                            }
+                        }
+                    };
+                    reader.readAsDataURL(blob);
+
+                    overlay.remove();
+                    document.removeEventListener('paste', onPaste);
+                    return;
+                }
+            }
+            alert("Você colou texto. Copie uma imagem (print) antes de colar.");
+        };
+
+        document.addEventListener('paste', onPaste);
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                overlay.remove();
+                document.removeEventListener('paste', onPaste);
+            }
+        });
+
+        const onEsc = (e) => {
+            if (e.key === 'Escape') {
+                overlay.remove();
+                document.removeEventListener('paste', onPaste);
+                document.removeEventListener('keydown', onEsc);
+            }
+        };
+        document.addEventListener('keydown', onEsc);
+    }
+
+    function desembrulharSpan(span) {
+        const parent = span.parentNode;
+        if (!parent) return;
+        while (span.firstChild) parent.insertBefore(span.firstChild, span);
+        parent.removeChild(span);
+        parent.normalize();
+    }
+
+    function posicionarMenu(rect) {
+        menuFlutuante.style.top = `${window.scrollY + rect.top - 50}px`;
+        menuFlutuante.style.left = `${window.scrollX + rect.left + (rect.width / 2) - 80}px`;
+        menuFlutuante.style.display = 'flex';
+    }
+
+    function esconderMenu() { if (menuFlutuante) menuFlutuante.style.display = 'none'; }
+
+    document.addEventListener('mouseup', (e) => {
+        if (!menuFlutuante) return;
+        if (menuFlutuante.contains(e.target) || e.target.closest('#ep-fab-container') || e.target.closest('#ep-modal-overlay')) return;
+
+        const spanGrifo = e.target.closest ? e.target.closest('.estudo-pro-grifo') : null;
+        const selecao = window.getSelection();
+        const temSelecao = selecao && !selecao.isCollapsed && selecao.toString().trim() !== "";
+
+        if (spanGrifo && !temSelecao) {
+            mostrarMenuGerenciarGrifo(spanGrifo.getBoundingClientRect(), spanGrifo);
+            return;
+        }
+
+        if (!temSelecao) { esconderMenu(); return; }
+        selecaoAtualGuardada = selecao.getRangeAt(0).cloneRange();
+        mostrarMenuSelecao(selecaoAtualGuardada.getBoundingClientRect());
+    });
+
+    // ------------------------------------------------------------------
+    // Indexação e Aplicação de Grifos
+    // ------------------------------------------------------------------
+    function indexarTexto() {
+        const nodes = [];
+        let T = '';
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            acceptNode(n) {
+                const p = n.parentElement;
+                if (!p || p.closest(IGNORAR_UI)) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        let n;
+        while ((n = walker.nextNode())) { nodes.push({ node: n, ini: T.length, fim: (T += n.nodeValue).length }); }
+        return { nodes, T };
+    }
+
+    function textoNormalizadoDoIntervalo(idx, ini, fim) {
+        let out = '';
+        let primeiro = true, blocoAnterior = null;
+        idx.nodes.forEach(e => {
+            const s = Math.max(ini, e.ini), f = Math.min(fim, e.fim);
+            if (f <= s) return;
+            const bloco = e.node.parentElement ? e.node.parentElement.closest(SEL_BLOCO) : null;
+            if (!primeiro && bloco !== blocoAnterior) out += ' ';
+            out += e.node.nodeValue.slice(s - e.ini, f - e.ini);
+            blocoAnterior = bloco; primeiro = false;
+        });
+        return out.replace(/\s+/g, ' ').trim();
+    }
+
+    function envolverTrechoDeTexto(node, start, end, span) {
+        let alvo = node;
+        if (end < node.nodeValue.length) node.splitText(end);
+        if (start > 0) alvo = node.splitText(start);
+        alvo.parentNode.insertBefore(span, alvo);
+        span.appendChild(alvo);
+    }
+
+    function envolverIntervalo(idx, ini, fim, cor, nota, url, idGrifo) {
+        const tarefas = [];
+        idx.nodes.forEach(e => {
+            const s = Math.max(ini, e.ini), f = Math.min(fim, e.fim);
+            if (f <= s) return;
+            const node = e.node, p = node.parentElement;
+            if (!p || p.closest('.estudo-pro-grifo') || p.matches(TAGS_ESTRUTURAIS)) return;
+            const trecho = node.nodeValue.slice(s - e.ini, f - e.ini);
+            if (!trecho.trim() && !(node.previousSibling && node.nextSibling)) return;
+            tarefas.push({ node, ls: s - e.ini, lf: f - e.ini });
+        });
+
+        tarefas.forEach(t => {
+            const span = document.createElement('span');
+            span.className = 'estudo-pro-grifo';
+            span.style.backgroundColor = cor || '#fef08a';
+            span.style.color = '#1a202c';
+            span.setAttribute('data-nota', nota || '');
+            span.setAttribute('data-url', url);
+            span.setAttribute('data-grifo-id', idGrifo);
+            envolverTrechoDeTexto(t.node, t.ls, t.lf, span);
+        });
+        return tarefas.length;
+    }
+
+    function aplicarGrifoEstavel(cor, nota) {
+        if (!selecaoAtualGuardada) return;
+        const range = selecaoAtualGuardada;
+        const url = urlAtual();
+        const idx = indexarTexto();
+        const T = idx.T;
+
+        let gIni = null, gFim = null;
+        idx.nodes.forEach(e => {
+            if (!range.intersectsNode(e.node)) return;
+            const s = (e.node === range.startContainer) ? range.startOffset : 0;
+            const f = (e.node === range.endContainer) ? range.endOffset : e.node.nodeValue.length;
+            if (f <= s) return;
+            if (gIni === null) gIni = e.ini + s;
+            gFim = e.ini + f;
+        });
+
+        if (gIni === null || gFim === null || gFim <= gIni) { return; }
+
+        while (gIni < gFim && /\s/.test(T[gIni])) gIni++;
+        while (gFim > gIni && /\s/.test(T[gFim - 1])) gFim--;
+        if (gFim <= gIni) return;
+
+        let trechoNorm = textoNormalizadoDoIntervalo(idx, gIni, gFim);
+        if (!trechoNorm) {
+            trechoNorm = T.slice(gIni, gFim).replace(/\s+/g, ' ').trim();
+        }
+        if (!trechoNorm) {
+            try {
+                const sel = window.getSelection();
+                trechoNorm = (sel && sel.toString() ? sel.toString() : '').replace(/\s+/g, ' ').trim();
+            } catch (e) { }
+        }
+        if (!trechoNorm) return;
+
+        const idGrifo = idDeterministico(url, trechoNorm);
+        const pgExistente = lerPagina(url);
+        if (pgExistente && pgExistente.grifos.some(g => g.id_grifo === idGrifo && !g.removido_em)) {
+            alert("Esse trecho já está grifado nesta página."); return;
+        }
+
+        const entrada = {
+            id_grifo: idGrifo, criado_em: Date.now(), inicio: gIni, fim: gFim,
+            exato: T.slice(gIni, gFim), prefixo: T.slice(Math.max(0, gIni - TAM_CONTEXTO), gIni),
+            sufixo: T.slice(gFim, gFim + TAM_CONTEXTO),
+            trecho_grifado: trechoNorm,
+            cor_fundo: cor, nota_vinculada: nota || null, revisto: false,
+            atualizado_em: Date.now()
+        };
+
+        aplicandoMutacaoInterna = true;
+        try {
+            if (envolverIntervalo(idx, gIni, gFim, cor, nota, url, idGrifo) === 0) { return; }
+            esconderMenu();
+            window.getSelection().removeAllRanges();
+            selecaoAtualGuardada = null;
+        } finally { setTimeout(() => { aplicandoMutacaoInterna = false; }, 0); }
+        adicionarGrifoSalvo(url, entrada);
+        agendarSyncAutomatico();
+    }
+
+    // 🔧 BLINDAGEM: desembrulha ao ler
+    function lerPagina(url) {
+        try {
+            const raw = stLer(PREFIXO_URL + url);
+            if (!raw) return null;
+            const p = desembrulhar(raw);
+            if (p && Array.isArray(p.grifos)) return p;
+        } catch (e) { console.warn('[EstudoPro] JSON inválido em', url, e); }
+        return null;
+    }
+
+    function salvarPagina(pagina) { stGravar(PREFIXO_URL + pagina.url, JSON.stringify(pagina)); }
+
+    function adicionarGrifoSalvo(url, entrada) {
+        if (!entrada || !entrada.trecho_grifado || !String(entrada.trecho_grifado).trim()) return;
+
+        const pagina = lerPagina(url) || { url: url, titulo: '', grifos: [] };
+        if (!pagina.titulo) pagina.titulo = (document.title || '').trim() || url;
+
+        const novoGrifo = { ...entrada };
+        delete novoGrifo.removido_em;
+
+        const idNovo = novoGrifo.id_grifo;
+        if (idNovo) {
+            pagina.grifos = pagina.grifos.filter(grifo => grifo.id_grifo !== idNovo);
+        }
+        pagina.grifos.push(novoGrifo);
+        salvarPagina(pagina);
+    }
+
+    function atualizarGrifoSalvo(url, idGrifo, campos) {
+        const pagina = lerPagina(url);
+        if (!pagina) return;
+        const entrada = pagina.grifos.find(g => g.id_grifo === idGrifo);
+        if (entrada) {
+            Object.assign(entrada, campos);
+            entrada.atualizado_em = Date.now();
+            salvarPagina(pagina);
+        }
+        agendarSyncAutomatico();
+    }
+
+    function removerGrifoSalvo(url, idGrifo) {
+        const pagina = lerPagina(url);
+        if (!pagina) return;
+        const entrada = pagina.grifos.find(g => g.id_grifo === idGrifo);
+        if (entrada) {
+            entrada.removido_em = Date.now();
+            entrada.atualizado_em = Date.now();
+            salvarPagina(pagina);
+        }
+        agendarSyncAutomatico();
+    }
+
+    // ------------------------------------------------------------------
+    // Saneamento retroativo — 🔧 BLINDADO
+    // ------------------------------------------------------------------
+    function sanearStorage() {
+        let corrigidos = 0;
+        stChaves(PREFIXO_URL).forEach(chave => {
+            try {
+                const raw = stLer(chave);
+                if (!raw) return;
+                const p = desembrulhar(raw);
+                if (!p || !Array.isArray(p.grifos)) return;
+                let mudou = false;
+                if (!p.titulo || !String(p.titulo).trim()) { p.titulo = p.url || chave.replace(PREFIXO_URL, ''); mudou = true; }
+                p.grifos.forEach(g => {
+                    if (!g.trecho_grifado && g.exato) { g.trecho_grifado = String(g.exato).replace(/\s+/g, ' ').trim(); mudou = true; }
+                    if (!g.trecho_grifado && g.texto) { g.trecho_grifado = String(g.texto).replace(/\s+/g, ' ').trim(); mudou = true; }
+                    if (!g.cor_fundo && g.cor) { g.cor_fundo = g.cor; mudou = true; }
+                    if (g.nota_vinculada == null && g.nota != null) { g.nota_vinculada = g.nota; mudou = true; }
+                });
+                if (mudou) { stGravar(chave, JSON.stringify(p)); corrigidos++; }
+            } catch (e) { }
+        });
+        return corrigidos;
+    }
+
+    // ------------------------------------------------------------------
+    // Exportação HTML — 🔧 BLINDADO
+    // ------------------------------------------------------------------
+    function coletarPaginas() {
+        const grupos = [];
+
+        stChaves(PREFIXO_URL).forEach(chave => {
+            try {
+                const raw = stLer(chave);
+                if (!raw) return;
+                const p = desembrulhar(raw);
+                if (p && Array.isArray(p.grifos) && p.grifos.length) {
+                    p.titulo = (p.titulo || '').trim() || p.url || 'Página sem título';
+                    grupos.push(p);
+                }
+            } catch (e) { }
+        });
+
+        const grifosLegado = [];
+        stChaves(PREFIXO_LEGADO).forEach(chave => {
+            try {
+                const raw = stLer(chave);
+                if (!raw) return;
+                const q = desembrulhar(raw);
+                if (q && Array.isArray(q.grifos_e_anotacoes) && q.grifos_e_anotacoes.length) {
+                    q.grifos_e_anotacoes.forEach((g, idx) => {
+                        grifosLegado.push({
+                            id_grifo: g.id_grifo || g.seg_id || ('legado-' + hashSimples(
+                                String(g.trecho_grifado || g.texto || '') + '|' + String(g.criado_em || g.criado || idx)
+                            )),
+                            cor_fundo: g.cor_fundo || '#fef08a',
+                            trecho_grifado: g.trecho_grifado || g.texto || '',
+                            nota_vinculada: g.nota_vinculada || g.nota || '',
+                            revisto: false
+                        });
+                    });
+                }
+            } catch (e) { }
+        });
+
+        if (grifosLegado.length > 0) {
+            grupos.push({ url: '#', titulo: '📂 Grifos Antigos (Questões/Legado)', grifos: grifosLegado });
+        }
+
+        return grupos;
+    }
+
+    function exportarHtmlInterativo() {
+        try {
+            sanearStorage();
+
+            const grupos = coletarPaginas();
+            const totalBruto = grupos.reduce((s, g) => s + g.grifos.length, 0);
+
+            if (grupos.length === 0 || totalBruto === 0) {
+                alert("Nenhum grifo ou anotação encontrado no armazenamento.\n\nVerifique o console (F12).");
+                return;
+            }
+
+            const pacote = {
+                config: {
+                    cores: {
+                        '#fef08a': 'Atenção / Geral',
+                        '#d8b4fe': 'Exceções / Prazos',
+                        '#bbf7d0': 'Regra / Jurisprudência',
+                        '#fbcfe8': 'Dúvida / Revisar',
+                        '#bfdbfe': 'Fórmulas'
+                    }
+                },
+                grupos: grupos.map(gr => ({
+                    url: gr.url || '#',
+                    titulo: (gr.titulo || '').trim() || 'Página sem título',
+                    grifos: gr.grifos
+                        .filter(g => !g.removido_em)
+                        .map(g => ({
+                            id: g.id_grifo || g.id || ('g-' + Math.random().toString(36).slice(2)),
+                            cor: g.cor_fundo || g.cor || '#fef08a',
+                            texto: String(g.trecho_grifado || g.exato || g.texto || '').trim(),
+                            nota: String(g.nota_vinculada || g.nota || '').trim(),
+                            revisto: !!g.revisto,
+                            criado: g.criado_em || 0,
+                            tags: []
+                        })).filter(g => g.texto.length > 0)
+                })).filter(gr => gr.grifos.length > 0)
+            };
+
+            if (pacote.grupos.length === 0) {
+                alert("Os grifos existem no storage mas não têm texto válido.\nVeja o console (F12).");
+                return;
+            }
+
+            const jsonSeguro = JSON.stringify(pacote)
+                .replace(/</g, '\\u003c')
+                .replace(/>/g, '\\u003e')
+                .replace(/&/g, '\\u0026')
+                .replace(/\u2028/g, '\\u2028')
+                .replace(/\u2029/g, '\\u2029');
+
+            const template = modeloHtmlCaderno();
+            if (!template || template.indexOf('__DADOS__') === -1) {
+                alert("Erro interno: template sem placeholder __DADOS__.");
+                return;
+            }
+
+            const html = template.split('__DADOS__').join(jsonSeguro);
+
+            const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `Caderno_Estrategico_${new Date().toISOString().split('T')[0]}.html`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+        } catch (err) {
+            alert("Erro ao exportar: " + err.message + "\nVeja o console (F12).");
+        }
+    }
+
+    function localizarTrecho(T, item) {
+        const ex = item.exato || item.trecho_grifado;
+        if (!ex) return null;
+
+        const pre = item.prefixo || '', suf = item.sufixo || '';
+        const len = ex.length;
+
+        if (item.inicio != null && T.substr(item.inicio, len) === ex) {
+            if (T.slice(Math.max(0, item.inicio - pre.length), item.inicio) === pre && T.substr(item.inicio + len, suf.length) === suf) return item.inicio;
+        }
+
+        let melhor = null, melhorTotal = -Infinity, melhorScore = 0, ocorrencias = 0, pos = -1;
+        while ((pos = T.indexOf(ex, pos + 1)) !== -1) {
+            ocorrencias++;
+            const score = tamSufixoComum(T.slice(Math.max(0, pos - pre.length), pos), pre) + tamPrefixoComum(T.substr(pos + len, suf.length), suf);
+            const dist = item.inicio != null ? Math.abs(pos - item.inicio) : 0;
+            const total = score * 1e6 - dist;
+            if (total > melhorTotal) { melhorTotal = total; melhor = pos; melhorScore = score; }
+        }
+
+        if (melhor === null) return null;
+        if (ocorrencias === 1) return melhor;
+
+        const minimo = Math.min(12, pre.length + suf.length);
+        if (minimo > 0 && melhorScore >= minimo) return melhor;
+        if (len >= 60) return melhor;
+
+        return null;
+    }
+
+    function restaurarGrifosSalvos() {
+        const itens = [];
+        const semBarra = s => s.replace(/\/+$/, '');
+        const rota = semBarra(location.origin + location.pathname);
+        stChaves(PREFIXO_URL).forEach(chave => {
+            const u = chave.slice(PREFIXO_URL.length), i = u.indexOf('?');
+            if (semBarra(i >= 0 ? u.slice(0, i) : u) === rota) {
+                const p = lerPagina(u);
+                if (p) p.grifos.forEach(g => itens.push({ g, url: p.url }));
+            }
+        });
+
+        const pendentes = itens.filter(({ g }) =>
+            !g.removido_em &&
+            !document.querySelector(`.estudo-pro-grifo[data-grifo-id="${escaparAttr(g.id_grifo)}"]`)
+        );
+
+        if (pendentes.length === 0) return;
+
+        pendentes.sort((a, b) => (a.g.criado_em || 0) - (b.g.criado_em || 0));
+
+        aplicandoMutacaoInterna = true;
+        try {
+            let idx = indexarTexto();
+            pendentes.forEach(({ g, url }) => {
+                const pos = localizarTrecho(idx.T, g);
+                if (pos !== null) {
+                    const ex = g.exato || g.trecho_grifado;
+                    if (envolverIntervalo(idx, pos, pos + ex.length, g.cor_fundo, g.nota_vinculada || '', url, g.id_grifo) > 0) {
+                        idx = indexarTexto();
+                    }
+                }
+            });
+        } finally { setTimeout(() => { aplicandoMutacaoInterna = false; }, 0); }
+    }
+
+    function modeloHtmlCaderno() {
+        const linhas = [
+"<!DOCTYPE html>",
+"<html lang=\"pt-BR\">",
+"<head>",
+"<meta charset=\"utf-8\">",
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+"<title>Painel de Revisão - Concurseiro</title>",
+"<style>",
+":root{--bg:#0f1420;--card:#1a202c;--card2:#232b3b;--borda:#334155;--txt:#e2e8f0;--mut:#94a3b8;--acc:#805ad5;--ok:#38a169;}",
+"@media (prefers-color-scheme: light){:root{--bg:#f1f5f9;--card:#ffffff;--card2:#f8fafc;--borda:#cbd5e1;--txt:#1e293b;--mut:#64748b;}}",
+"*{box-sizing:border-box}",
+"body{margin:0;background:var(--bg);color:var(--txt);font-size:15px;font-family:system-ui,sans-serif;}",
+"header{position:sticky;top:0;z-index:10;background:var(--card);border-bottom:1px solid var(--borda);padding:15px 20px;}",
+".topo-linha{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:15px;margin-bottom:12px;}",
+"header h1{margin:0;font-size:18px;display:flex;align-items:center;gap:10px;}",
+".controles{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}",
+"input[type=search], input[type=text], select, textarea {background:var(--card2);color:var(--txt);border:1px solid var(--borda);border-radius:6px;padding:8px;font-family:inherit;}",
+"input[type=search]:focus, input[type=text]:focus, select:focus, textarea:focus {outline:none;border-color:var(--acc);}",
+"input[type=search]{min-width:260px;}",
+".btn{background:var(--card2);color:var(--txt);border:1px solid var(--borda);border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;font-weight:600;}",
+".btn:hover{border-color:var(--acc);}",
+".btn-destaque{background:var(--acc);color:#fff;border:none;}",
+".btn-destaque:hover{filter:brightness(1.1);}",
+".layout{display:flex; gap:20px; max-width:1200px; margin:20px auto; padding:0 15px;}",
+".sidebar{width:300px; flex-shrink:0; align-self:start; position:sticky; top:170px;}",
+".painel-stats{background:var(--card); border:1px solid var(--borda); border-radius:10px; padding:15px; margin-bottom:15px;}",
+".progresso-bg{background:var(--card2); height:12px; border-radius:6px; margin:10px 0; overflow:hidden;}",
+".progresso-bar{background:var(--ok); height:100%; width:0%; transition:width 0.4s;}",
+".sumario-lista{list-style:none; padding:0; margin:0; max-height:400px; overflow-y:auto; font-size:13px;}",
+".sumario-lista li{margin-bottom:8px;}",
+".sumario-lista a{color:var(--mut); text-decoration:none; cursor:pointer;}",
+".sumario-lista a:hover{color:var(--acc);}",
+"main{flex:1; padding-bottom:110px;}",
+".q{background:var(--card);border:1px solid var(--borda);border-radius:10px;margin-bottom:20px;overflow:hidden;}",
+".q-head{background:var(--card2);padding:12px 15px;border-bottom:1px solid var(--borda);display:flex;justify-content:space-between;align-items:center;}",
+".q-titulo{font-weight:bold;font-size:15px;cursor:pointer;display:flex;align-items:center;gap:8px;}",
+".q-link{color:var(--mut);font-size:12px;text-decoration:none;}",
+".q-link:hover{color:var(--acc);text-decoration:underline;}",
+".q-body{padding:15px;display:flex;flex-direction:column;gap:15px;}",
+".g{border-left:5px solid;background:var(--card2);border-radius:6px;padding:15px;transition:opacity 0.2s;}",
+".g-texto mark { color: #1a202c; padding: 2px 5px; border-radius: 3px; line-height: 1.9; font-weight: 500; cursor: pointer; }",
+".g-nota{margin-top:12px;background:var(--card);padding:10px;border-radius:6px;border-left:3px solid var(--acc);font-size:14px;white-space:pre-wrap;}",
+".g-nota b, .g-nota strong { font-weight: bold; }",
+".g-nota i, .g-nota em { font-style: italic; }",
+".g-nota u { text-decoration: underline; }",
+".g-nota ul { padding-left: 20px; margin: 5px 0; }",
+".g-nota li { margin-bottom: 4px; }",
+".g-nota mark { background: #fef08a; color: #1a202c; padding: 2px 4px; border-radius: 2px; }",
+".g-nota details { margin-top:8px; background:#2d3748; padding:6px; border-radius:4px; border:1px solid #4a5568; }",
+".g-nota summary { cursor:pointer; font-size:12px; color:#a0aec0; font-weight:bold; outline:none; }",
+".g-nota details img { max-width:100%; border-radius:4px; margin-top:8px; display:block; }",
+".g-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}",
+".tag{background:var(--card);border:1px solid var(--acc);color:var(--txt);border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600;}",
+".tag b{cursor:pointer;color:var(--mut);margin-left:4px;}",
+".tag b:hover{color:#e53e3e;}",
+".filtros-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}",
+".filtros-tags:empty{display:none;}",
+".tag-chip{cursor:pointer;border:1px solid var(--borda);background:var(--card2);color:var(--txt);padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;}",
+".tag-chip:hover{border-color:var(--acc);}",
+".tag-chip.active{background:var(--acc);color:#fff;border-color:var(--acc);}",
+".filtros-cores{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}",
+".chip{padding:4px 12px;border-radius:15px;border:2px solid transparent;cursor:pointer;font-size:12px;font-weight:bold;color:#1a202c;opacity:0.6;transition:opacity 0.2s;}",
+".chip:hover{opacity:0.8;}",
+".chip.active{opacity:1;border-color:#fff;box-shadow:0 0 0 2px var(--acc);}",
+".modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;z-index:200;}",
+".modal-box{background:var(--card2);padding:25px;border-radius:10px;width:380px;border:1px solid var(--borda);display:flex;flex-direction:column;gap:15px;}",
+"#ep-menu-interativo { position: absolute; background: #2d3748; color: #fff; padding: 10px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); z-index: 1000; display: none; flex-direction: column; align-items: center; border: 1px solid #4a5568; }",
+".note-modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 2000; }",
+".note-modal-box { background: var(--card); width: 600px; max-width: 90%; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid var(--borda); display: flex; flex-direction: column; }",
+".note-modal-header { padding: 15px 20px; border-bottom: 1px solid var(--borda); display: flex; justify-content: space-between; align-items: center; font-weight: bold; }",
+".note-toolbar { display: flex; gap: 5px; padding: 10px 20px; background: var(--card2); border-bottom: 1px solid var(--borda); }",
+".note-toolbar button { background: transparent; border: 1px solid transparent; color: var(--txt); width: 30px; height: 30px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: bold; }",
+".note-toolbar button:hover { background: var(--borda); border-color: var(--borda); }",
+".note-editor { width: 100%; height: 200px; background: var(--bg); color: var(--txt); border: none; padding: 20px; font-family: inherit; font-size: 15px; resize: vertical; outline: none; line-height: 1.6; overflow-y: auto; }",
+".note-editor img { max-width: 100%; height: auto; border-radius: 6px; margin: 10px 0; border: 1px solid var(--borda); }",
+".note-modal-footer { padding: 15px 20px; border-top: 1px solid var(--borda); display: flex; justify-content: flex-end; gap: 10px; }",
+"@media print{ header, .sidebar{display:none !important;} body{background:#fff;color:#000;} .q,.g{border-color:#ccc;break-inside:avoid;} .g-footer, .g-edit, .tag b{display:none !important;} }",
+"</style>",
+"</head>",
+"<body>",
+"<div id=\"ep-menu-interativo\"></div>",
+"",
+"<div class=\"note-modal-overlay\" id=\"note-modal\">",
+"    <div class=\"note-modal-box\">",
+"        <div class=\"note-modal-header\">",
+"            <span>📝 Editar Anotação</span>",
+"            <button onclick=\"fecharNoteModal()\" style=\"background:none;border:none;color:var(--mut);cursor:pointer;font-size:20px;\">&times;</button>",
+"        </div>",
+"        <div class=\"note-toolbar\">",
+"            <button title=\"Negrito\" onclick=\"formatNote('bold')\"><b>B</b></button>",
+"            <button title=\"Itálico\" onclick=\"formatNote('italic')\"><i>I</i></button>",
+"            <button title=\"Sublinhado\" onclick=\"formatNote('underline')\"><u>U</u></button>",
+"            <button title=\"Destaque\" onclick=\"toggleHighlight()\" style=\"background:#fef08a;color:#1a202c;\">🖊️</button>",
+"            <button title=\"Lista\" onclick=\"formatNote('insertUnorderedList')\">•</button>",
+"            <button title=\"Limpar Formatação\" onclick=\"formatNote('removeFormat')\">🧹</button>",
+"        </div>",
+"        <div id=\"note-editor\" class=\"note-editor\" contenteditable=\"true\"></div>",
+"        <div class=\"note-modal-footer\">",
+"            <button class=\"btn\" onclick=\"fecharNoteModal()\">Cancelar</button>",
+"            <button class=\"btn btn-destaque\" onclick=\"salvarNotaProfissional()\">Salvar Nota</button>",
+"        </div>",
+"    </div>",
+"</div>",
+"",
+"<header>",
+"    <div class=\"topo-linha\">",
+"        <h1>🎯 Painel de Revisão e Retenção</h1>",
+"    </div>",
+"    <div class=\"controles\">",
+"        <input type=\"search\" id=\"busca\" placeholder=\"Buscar texto, anotações ou tags...\">",
+"        <select id=\"modo-visao\">",
+"            <option value=\"aula\">📚 Por aula</option>",
+"            <option value=\"data\">📅 Por data</option>",
+"            <option value=\"tag\">🏷️ Por tag</option>",
+"        </select>",
+"        <div class=\"filtros-cores\" id=\"filtros-cores\"></div>",
+"        <button class=\"btn btn-icon\" onclick=\"abrirModalCores()\">⚙️ Nomear Cores</button>",
+"    </div>",
+"    <div class=\"filtros-tags\" id=\"filtros-tags\"></div>",
+"</header>",
+"<div class=\"layout\">",
+"    <aside class=\"sidebar\">",
+"        <div class=\"painel-stats\">",
+"            <h3 style=\"margin-top:0; font-size:15px; margin-bottom:10px;\">📊 Desempenho</h3>",
+"            <div id=\"stats-resumo\" style=\"font-size:13px; color:var(--mut);\">Carregando...</div>",
+"            <div class=\"progresso-bg\"><div class=\"progresso-bar\" id=\"barra-progresso\"></div></div>",
+"        </div>",
+"        <div class=\"painel-stats\">",
+"            <h3 style=\"margin-top:0; font-size:15px; margin-bottom:10px;\">📑 Sumário</h3>",
+"            <ul class=\"sumario-lista\" id=\"sumario\"></ul>",
+"        </div>",
+"    </aside>",
+"    <main id=\"lista\"></main>",
+"</div>",
+"<div class=\"modal-overlay\" id=\"modal-cores\">",
+"    <div class=\"modal-box\">",
+"        <div style=\"font-weight:bold;font-size:16px;\">⚙️ Organizar Cores da Revisão</div>",
+"        <div id=\"modal-cores-lista\"></div>",
+"        <div style=\"display:flex;justify-content:flex-end;gap:10px;margin-top:10px;\">",
+"            <button class=\"btn\" onclick=\"fecharModalCores()\">Cancelar</button>",
+"            <button class=\"btn btn-destaque\" onclick=\"salvarCores()\">Salvar</button>",
+"        </div>",
+"    </div>",
+"</div>",
+"<scr"+"ipt id=\"dados\" type=\"application/json\">__DADOS__</scr"+"ipt>",
+"<scr"+"ipt>",
+"const escapeHtml = (str) => {",
+"    if(str === undefined || str === null) return '';",
+"    const div = document.createElement('div'); div.textContent = String(str); return div.innerHTML;",
+"};",
+"const CHAVE_DB = 'revisao_db_v1';",
+"let db;",
+"try {",
+"    const raw = document.getElementById('dados').textContent.trim();",
+"    if (!raw || raw === '__DADOS__') throw new Error('placeholder nao substituido');",
+"    db = JSON.parse(raw);",
+"    console.log('[Revisao] JSON ok:', (db.grupos||[]).length, 'grupos');",
+"} catch (e) {",
+"    console.error('[Revisao] JSON invalido:', e);",
+"    db = { config: { cores: {} }, grupos: [] };",
+"}",
+"if (!Array.isArray(db.grupos)) db.grupos = [];",
+"if (!db.config) db.config = { cores: {} };",
+"if (!db.config.cores) db.config.cores = {};",
+"function persistir() {",
+"    try { localStorage.setItem(CHAVE_DB, JSON.stringify(db)); } catch (e) { }",
+"}",
+"let filtroCor = null;",
+"let filtroTag = null;",
+"const SEM_TAG = '__sem__';",
+"function normTag(s) {",
+"    let out = '';",
+"    s = String(s || '').toLowerCase();",
+"    for (const c of s) {",
+"        if (c.toLowerCase() !== c.toUpperCase() || (c >= '0' && c <= '9') || c === ' ' || c === '-' || c === '_' || c === '/' || c === '.') out += c;",
+"    }",
+"    return out.split(' ').filter(Boolean).join(' ');",
+"}",
+"function unicos(arr) { return Array.from(new Set(arr)); }",
+"function parseTags(str) { return unicos(String(str || '').split(';').join(',').split(',').map(normTag).filter(Boolean)); }",
+"function hashSimples(s) {",
+"    let h = 0;",
+"    for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }",
+"    return Math.abs(h).toString(36);",
+"}",
+"(function prepararDados() {",
+"    const vistos = new Set();",
+"    db.grupos.forEach(gr => {",
+"        if (!Array.isArray(gr.grifos)) gr.grifos = [];",
+"        gr.grifos.forEach(g => {",
+"            let id = String(g.id || '');",
+"            if (!id || !/[\\w-]+/.test(id) || vistos.has(id)) {",
+"                let base = 'h' + hashSimples((g.texto || '') + '|' + (g.criado || ''));",
+"                let candidato = base;",
+"                let k = 0;",
+"                while (vistos.has(candidato)) { candidato = base + '_' + (k++); }",
+"                id = candidato;",
+"            }",
+"            g.id = id;",
+"            vistos.add(id);",
+"            g.tags = Array.isArray(g.tags) ? parseTags(g.tags.join(',')) : [];",
+"        });",
+"    });",
+"})();",
+"function acharPorId(id) {",
+"    for (const gr of db.grupos) for (const g of gr.grifos) if (g.id === id) return g;",
+"    return null;",
+"}",
+"function todasTags() {",
+"    const mapa = {};",
+"    db.grupos.forEach(gr => gr.grifos.forEach(g => g.tags.forEach(t => { mapa[t] = (mapa[t] || 0) + 1; })));",
+"    return Object.keys(mapa).sort((a, b) => a.localeCompare(b, 'pt-BR')).map(t => [t, mapa[t]]);",
+"}",
+"function chaveData(ts) {",
+"    if (!ts) return 'sem-data';",
+"    const d = new Date(ts);",
+"    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');",
+"}",
+"function rotuloData(chave) {",
+"    if (chave === 'sem-data') return '📂 Sem data (legado)';",
+"    const p = chave.split('-');",
+"    return '📅 ' + p[2] + '/' + p[1] + '/' + p[0];",
+"}",
+"function secoesDaVisao() {",
+"    const modo = document.getElementById('modo-visao').value;",
+"    if (modo === 'aula') {",
+"        return db.grupos.map((gr, gIdx) => ({",
+"            titulo: gr.titulo, url: gr.url, mostrarAula: false, isGroup: true, gIdxOrig: gIdx,",
+"            itens: gr.grifos.map((g, iIdx) => ({ g, gIdx, iIdx }))",
+"        }));",
+"    }",
+"    if (modo === 'tag') {",
+"        const mapaTag = {};",
+"        db.grupos.forEach((gr, gIdx) => gr.grifos.forEach((g, iIdx) => {",
+"            const ts = g.tags.length ? g.tags : [SEM_TAG];",
+"            ts.forEach(t => { (mapaTag[t] = mapaTag[t] || []).push({ g, gIdx, iIdx }); });",
+"        }));",
+"        return Object.keys(mapaTag).sort((a, b) => a === SEM_TAG ? 1 : b === SEM_TAG ? -1 : a.localeCompare(b, 'pt-BR'))",
+"            .map(k => ({ titulo: k === SEM_TAG ? '🏷️ Sem tag' : '🏷️ #' + k, url: '', mostrarAula: true, itens: mapaTag[k] }));",
+"    }",
+"    const mapa = {};",
+"    db.grupos.forEach((gr, gIdx) => gr.grifos.forEach((g, iIdx) => {",
+"        const k = chaveData(g.criado);",
+"        (mapa[k] = mapa[k] || []).push({ g, gIdx, iIdx });",
+"    }));",
+"    return Object.keys(mapa).sort((a, b) => a === 'sem-data' ? 1 : b === 'sem-data' ? -1 : b.localeCompare(a))",
+"        .map(k => ({ titulo: rotuloData(k), url: '', mostrarAula: true, itens: mapa[k] }));",
+"}",
+"function htmlTagsGrifo(g) {",
+"    if (!g.tags.length) return '';",
+"    return '<div class=\"g-tags\">' + g.tags.map(t => '<span class=\"tag\">#' + escapeHtml(t) + ' <b data-id=\"' + escapeHtml(g.id) + '\" data-tag=\"' + escapeHtml(t) + '\" onclick=\"removerTagEl(this)\">×</b></span>').join('') + '</div>';",
+"}",
+"function render() {",
+"    const lista = document.getElementById('lista');",
+"    const sumario = document.getElementById('sumario');",
+"    const termoBusca = document.getElementById('busca').value.toLowerCase();",
+"    if (filtroTag && filtroTag !== SEM_TAG && !todasTags().some(([t]) => t === filtroTag)) filtroTag = null;",
+"    let html = '';",
+"    let sumarioHtml = '';",
+"    let total = 0, revistos = 0, comNota = 0;",
+"    const vistosTotais = new Set();",
+"    const secoes = secoesDaVisao();",
+"    secoes.forEach(gr => {",
+"        let countSecao = 0;",
+"        gr.itens.forEach(({ g }) => {",
+"            if (!vistosTotais.has(g.id)) {",
+"                vistosTotais.add(g.id); total++;",
+"                if (g.revisto) revistos++;",
+"                if (g.nota) comNota++;",
+"            }",
+"            countSecao++;",
+"        });",
+"        gr._totalReal = countSecao;",
+"    });",
+"    secoes.forEach((gr, sIdx) => {",
+"        let grifosHtml = '';",
+"        let idSecao = 'aula-' + sIdx;",
+"        gr.itens.forEach(({ g, gIdx, iIdx }) => {",
+"            const corHex = g.cor || '#fef08a';",
+"            let pular = false;",
+"            if (filtroCor && corHex !== filtroCor) pular = true;",
+"            if (filtroTag) {",
+"                if (filtroTag === SEM_TAG) { if (g.tags.length) pular = true; }",
+"                else if (!g.tags.includes(filtroTag)) pular = true;",
+"            }",
+"            const txt = (String(g.texto || '') + ' ' + String(g.nota || '') + ' ' + g.tags.join(' ')).toLowerCase();",
+"            if (termoBusca && !txt.includes(termoBusca)) pular = true;",
+"            if (pular) return;",
+"            const chave = sIdx + '-' + gIdx + '-' + iIdx;",
+"            grifosHtml += `<div class=\"g\" data-id=\"${g.id}\" style=\"border-left-color: ${corHex}; opacity: ${g.revisto ? '0.85' : '1'};\">",
+"                <div id=\"view-${chave}\">",
+"                    ${gr.mostrarAula ? `<div style=\"font-size:11px;color:var(--mut);margin-bottom:6px;\">📚 ${escapeHtml(db.grupos[gIdx].titulo)}</div>` : ''}",
+"                    <div class=\"g-texto\"><mark style=\"background:${corHex};\" onclick=\"abrirMenuGrifo(event, '${g.id}')\">${escapeHtml(g.texto)}</mark></div>",
+"                    ${g.nota ? `<div class=\"g-nota\"><strong>📌 Anotação:</strong><br>${g.nota}</div>` : ''}",
+"                    ${htmlTagsGrifo(g)}",
+"                    <div class=\"g-footer\"><label style=\"cursor:pointer; display:flex; align-items:center; gap:6px; font-weight:600; color:${g.revisto ? 'var(--ok)' : 'var(--txt)'}\">",
+"                        <input type=\"checkbox\" ${g.revisto ? 'checked' : ''} onchange=\"toggleRevisto(${gIdx}, ${iIdx})\"> ${g.revisto ? '✓ Revisado' : 'Marcar Revisado'}</label></div>",
+"                </div>",
+"            </div>`;",
+"        });",
+"        if (gr._totalReal > 0) {",
+"            const tituloExibicao = escapeHtml(gr.titulo || 'Página sem título');",
+"            sumarioHtml += `<li><a href=\"#${idSecao}\" onclick=\"event.preventDefault(); scrollToSecao('${idSecao}')\">${tituloExibicao} (${gr._totalReal})</a></li>`;",
+"            if (grifosHtml.trim() !== '') {",
+"                html += `<article class=\"q\" id=\"${idSecao}\"><div class=\"q-head\"><div class=\"q-titulo\">",
+"                    ${gr.isGroup ? `<span onclick=\"renomearGrupo(${gr.gIdxOrig})\" title=\"Clique para renomear\">${tituloExibicao}</span>` : `<span>${tituloExibicao}</span>`}",
+"                    </div>${gr.url ? `<a href=\"${escapeHtml(gr.url)}\" target=\"_blank\" class=\"q-link\">Fonte ↗</a>` : ''}</div>",
+"                    <div class=\"q-body\">${grifosHtml}</div></article>`;",
+"            }",
+"        }",
+"    });",
+"    lista.innerHTML = html || '<div style=\"text-align:center; padding: 40px; color: var(--mut); font-size:16px;\">Nenhum grifo corresponde aos filtros selecionados.</div>';",
+"    sumario.innerHTML = sumarioHtml;",
+"    const pct = total > 0 ? Math.round((revistos/total)*100) : 0;",
+"    document.getElementById('stats-resumo').innerHTML = `Grifos: <b>${total}</b> <br>Notas: <b>${comNota}</b> <br>Feito: <b>${pct}%</b>`;",
+"    document.getElementById('barra-progresso').style.width = pct + '%';",
+"    renderFiltros();",
+"    renderFiltrosTags();",
+"    persistir();",
+"}",
+"window.renomearGrupo = (gIdx) => {",
+"    const atual = db.grupos[gIdx].titulo;",
+"    const novo = prompt('Novo nome para a aula/matéria:', atual);",
+"    if (novo && novo.trim() !== '') { db.grupos[gIdx].titulo = novo.trim(); render(); }",
+"};",
+"window.scrollToSecao = (idSecao) => {",
+"    filtroCor = null;",
+"    filtroTag = null;",
+"    document.getElementById('busca').value = '';",
+"    render();",
+"    const alvo = document.getElementById(idSecao);",
+"    if (alvo) {",
+"        const topoHeader = document.querySelector('header').offsetHeight + 20;",
+"        const y = alvo.getBoundingClientRect().top + window.scrollY - topoHeader;",
+"        window.scrollTo({ top: y, behavior: 'smooth' });",
+"    }",
+"};",
+"window.abrirMenuGrifo = (ev, id) => {",
+"    ev.preventDefault();",
+"    ev.stopPropagation();",
+"    const g = acharPorId(id);",
+"    if (!g) return;",
+"    const menu = document.getElementById('ep-menu-interativo');",
+"    menu.style.display = 'flex';",
+"    menu.style.top = (ev.pageY - 40) + 'px';",
+"    menu.style.left = (ev.pageX - 100) + 'px';",
+"    menu.innerHTML = `",
+"        <div style=\"font-size:11px; color:#a0aec0; width:100%; margin-bottom:5px; text-align:center;\">Gerenciar</div>",
+"        <div style=\"display:flex; gap:6px; margin-bottom:8px; justify-content:center;\">",
+"            ${Object.entries(db.config.cores).map(([hex, nome]) => `",
+"                <div style=\"background:${hex}; width:18px; height:18px; border-radius:50%; cursor:pointer; border:2px solid ${hex === g.cor ? '#fff' : 'transparent'}\" onclick=\"mudarCorGrifo('${id}', '${hex}')\" title=\"${escapeHtml(nome)}\"></div>",
+"            `).join('')}",
+"        </div>",
+"        <div style=\"display:flex; gap:6px; justify-content:center;\">",
+"            <button class=\"btn btn-icon\" onclick=\"editarNotaGrifo('${id}')\" title=\"Editar Nota\" style=\"font-size:16px; padding:4px 8px; border:1px solid var(--borda); background:var(--card2);\">📝</button>",
+"            <button class=\"btn btn-icon\" onclick=\"addTagGrifo('${id}')\" title=\"Adicionar Tag\" style=\"font-size:16px; padding:4px 8px; border:1px solid var(--borda); background:var(--card2);\">🏷️</button>",
+"            <button class=\"btn btn-icon\" onclick=\"removerGrifoPorId('${id}')\" title=\"Excluir\" style=\"font-size:16px; padding:4px 8px; border:1px solid var(--borda); background:#e53e3e; color:#fff;\">🗑️</button>",
+"        </div>`;",
+"    const fechaMenu = (e) => {",
+"        if (!menu.contains(e.target)) { menu.style.display = 'none'; document.removeEventListener('click', fechaMenu); }",
+"    };",
+"    setTimeout(() => document.addEventListener('click', fechaMenu), 10);",
+"};",
+"window.mudarCorGrifo = (id, hex) => {",
+"    const g = acharPorId(id);",
+"    if (g) { g.cor = hex; render(); document.getElementById('ep-menu-interativo').style.display = 'none'; }",
+"};",
+"let _editandoNotaId = null;",
+"window.editarNotaGrifo = (id) => {",
+"    _editandoNotaId = id;",
+"    const g = acharPorId(id);",
+"    if (!g) return;",
+"    const editor = document.getElementById('note-editor');",
+"    editor.innerHTML = g.nota || '';",
+"    document.getElementById('note-modal').style.display = 'flex';",
+"    editor.focus();",
+"    document.getElementById('ep-menu-interativo').style.display = 'none';",
+"};",
+"window.fecharNoteModal = () => { document.getElementById('note-modal').style.display = 'none'; _editandoNotaId = null; };",
+"window.formatNote = (cmd, val = null) => { document.execCommand(cmd, false, val); document.getElementById('note-editor').focus(); };",
+"window.toggleHighlight = () => {",
+"    if (document.queryCommandValue('hiliteColor') === 'rgb(254, 240, 138)' || document.queryCommandValue('backColor') === 'rgb(254, 240, 138)') {",
+"        document.execCommand('hiliteColor', false, 'transparent');",
+"    } else {",
+"        document.execCommand('hiliteColor', false, '#fef08a');",
+"    }",
+"    document.getElementById('note-editor').focus();",
+"};",
+"window.salvarNotaProfissional = () => {",
+"    if (!_editandoNotaId) return;",
+"    const g = acharPorId(_editandoNotaId);",
+"    if (!g) return;",
+"    const html = document.getElementById('note-editor').innerHTML;",
+"    const isVazio = html === '<br>' || html === '<div><br></div>' || html.trim() === '';",
+"    g.nota = isVazio ? '' : html;",
+"    render();",
+"    fecharNoteModal();",
+"};",
+"function renderFiltros() {",
+"    document.getElementById('filtros-cores').innerHTML = Object.entries(db.config.cores).map(([hex, nome]) =>",
+"        `<div class=\"chip ${filtroCor === hex ? 'active' : ''}\" style=\"background:${hex};\" onclick=\"setFiltro('${hex}')\">${escapeHtml(nome)}</div>`",
+"    ).join('');",
+"}",
+"function renderFiltrosTags() {",
+"    const c = document.getElementById('filtros-tags');",
+"    const tags = todasTags();",
+"    if (tags.length === 0) { c.innerHTML = ''; return; }",
+"    let semTag = 0;",
+"    db.grupos.forEach(gr => gr.grifos.forEach(g => { if (!g.tags.length) semTag++; }));",
+"    let h = '';",
+"    tags.forEach(([t, n]) => {",
+"        h += '<span class=\"tag-chip' + (filtroTag === t ? ' active' : '') + '\" data-tag=\"' + escapeHtml(t) + '\" onclick=\"setFiltroTag(this.dataset.tag)\">#' + escapeHtml(t) + ' (' + n + ')</span>';",
+"    });",
+"    if (semTag > 0) h += '<span class=\"tag-chip' + (filtroTag === SEM_TAG ? ' active' : '') + '\" data-tag=\"' + SEM_TAG + '\" onclick=\"setFiltroTag(this.dataset.tag)\">Sem tag (' + semTag + ')</span>';",
+"    c.innerHTML = h;",
+"}",
+"window.setFiltro = (hex) => { filtroCor = filtroCor === hex ? null : hex; render(); };",
+"window.setFiltroTag = (t) => { filtroTag = filtroTag === t ? null : t; render(); };",
+"window.addTagGrifo = (id) => {",
+"    const g = acharPorId(id);",
+"    if (!g) return;",
+"    const txt = prompt('Tags para este grifo (separe por vírgula):', '');",
+"    if (txt === null) return;",
+"    const novas = parseTags(txt);",
+"    if (novas.length === 0) return;",
+"    g.tags = unicos(g.tags.concat(novas));",
+"    render();",
+"    document.getElementById('ep-menu-interativo').style.display = 'none';",
+"};",
+"window.removerTagEl = (el) => {",
+"    const g = acharPorId(el.dataset.id);",
+"    if (!g) return;",
+"    g.tags = g.tags.filter(t => t !== el.dataset.tag);",
+"    render();",
+"};",
+"window.toggleRevisto = (g, i) => { db.grupos[g].grifos[i].revisto = !db.grupos[g].grifos[i].revisto; render(); };",
+"window.removerGrifoPorId = (id) => {",
+"    if (!confirm('🗑️ Deseja excluir permanentemente este grifo?')) return;",
+"    for (let gi = 0; gi < db.grupos.length; gi++) {",
+"        const gr = db.grupos[gi];",
+"        const idx = gr.grifos.findIndex(g => g.id === id);",
+"        if (idx >= 0) {",
+"            gr.grifos.splice(idx, 1);",
+"            if (gr.grifos.length === 0) db.grupos.splice(gi, 1);",
+"            document.getElementById('ep-menu-interativo').style.display = 'none';",
+"            render();",
+"            return;",
+"        }",
+"    }",
+"};",
+"window.cancelarEdicao = (g, i, s) => {",
+"    const k = s + '-' + g + '-' + i;",
+"    document.getElementById('view-' + k).style.display = 'block';",
+"    document.getElementById('edit-' + k).style.display = 'none';",
+"};",
+"window.salvarGrifo = (g, i, s) => {",
+"    const k = s + '-' + g + '-' + i;",
+"    const gr = db.grupos[g].grifos[i];",
+"    gr.texto = document.getElementById('val-txt-' + k).value;",
+"    gr.nota = document.getElementById('val-nota-' + k).value;",
+"    gr.cor = document.getElementById('val-cor-' + k).value;",
+"    gr.tags = parseTags(document.getElementById('val-tags-' + k).value);",
+"    render();",
+"};",
+"window.abrirModalCores = () => {",
+"    document.getElementById('modal-cores-lista').innerHTML = Object.entries(db.config.cores).map(([hex, nome]) => `",
+"        <div style=\"display:flex; gap:10px; align-items:center; margin-bottom:10px;\">",
+"            <div style=\"width:24px; height:24px; border-radius:50%; background:${hex};\"></div>",
+"            <input type=\"text\" id=\"cor-input-${hex.replace('#','')}\" value=\"${escapeHtml(nome)}\" style=\"flex:1;\">",
+"        </div>`).join('');",
+"    document.getElementById('modal-cores').style.display = 'flex';",
+"};",
+"window.salvarCores = () => {",
+"    Object.keys(db.config.cores).forEach(hex => {",
+"        const input = document.getElementById(`cor-input-${hex.replace('#','')}`);",
+"        if (input) db.config.cores[hex] = input.value;",
+"    });",
+"    document.getElementById('modal-cores').style.display = 'none';",
+"    render();",
+"};",
+"window.fecharModalCores = () => { document.getElementById('modal-cores').style.display = 'none'; };",
+"document.getElementById('busca').addEventListener('input', render);",
+"document.getElementById('modo-visao').addEventListener('change', () => {",
+"    filtroCor = null;",
+"    filtroTag = null;",
+"    render();",
+"});",
+"render();",
+"</scr"+"ipt>",
+"</body>",
+"</html>"
+        ];
+        return linhas.join('\n');
+    }
+
+})();
